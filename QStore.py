@@ -1,161 +1,124 @@
 import os
 import sys
 import json
-import shutil
-import urllib.parse as urlparse
-import subprocess
 import base64
-import glob
-import re
+import urllib.parse
+import shutil
+import requests
 import tempfile
+import subprocess
 
-def is_text(content_bytes):
+def uri_encode_file(filepath):
+    with open(filepath, 'rb') as f:
+        data = f.read()
     try:
-        content_bytes.decode('utf-8')
-        return True
+        text = data.decode('utf-8')
+        return urllib.parse.quote(text), "URI"
     except UnicodeDecodeError:
-        return False
+        return base64.b64encode(data).decode(), "b64"
 
-def folder_to_json(folder_path, folder_name_override=None):
-    files = []
-    for root, dirs, filenames in os.walk(folder_path):
-        if '.git' in dirs:
-            dirs.remove('.git')
-        for name in filenames:
-            if name.startswith('.git'):
-                continue
-            filepath = os.path.join(root, name)
-            relpath = os.path.relpath(filepath, folder_path).replace(os.sep, "/")
-            with open(filepath, "rb") as f:
-                content = f.read()
-                if is_text(content):
-                    files.append({
-                        "path": relpath,
-                        "content": urlparse.quote(content.decode('utf-8')),
-                        "storetype": "URI"
-                    })
-                else:
-                    files.append({
-                        "path": relpath,
-                        "content": base64.b64encode(content).decode('ascii'),
-                        "storetype": "b64"
-                    })
-    return {
-        "folder": folder_name_override if folder_name_override else os.path.basename(folder_path),
-        "files": files
-    }
+def save_qf2(folder_path, output_path):
+    qf2 = {"folder": os.path.basename(folder_path), "files": []}
+    for root, _, files in os.walk(folder_path):
+        if ".git" in root: continue
+        for f in files:
+            fp = os.path.join(root, f)
+            rel = os.path.relpath(fp, folder_path)
+            content, storetype = uri_encode_file(fp)
+            qf2["files"].append({
+                "path": rel.replace("\\", "/"),
+                "storetype": storetype,
+                "content": content
+            })
+    with open(output_path, 'w', encoding='utf-8') as out:
+        json.dump(qf2, out, indent=2)
 
-def get_repo_name_from_git_config(git_folder):
-    config_path = os.path.join(git_folder, ".git", "config")
-    if not os.path.exists(config_path):
-        return None
-    with open(config_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if "url =" in line:
-                url = line.split("=", 1)[1].strip()
-                return url.rstrip("/").split("/")[-1].replace(".git", "")
-    return None
+def load_qf2(path_or_text):
+    if os.path.exists(path_or_text):
+        with open(path_or_text, encoding='utf-8') as f:
+            return json.load(f)
+    return json.loads(path_or_text)
 
-def clone_and_convert(git_url):
+def build_qf2(qf2_data, output_dir=None):
+    folder = qf2_data["folder"]
+    target = output_dir or folder
+    os.makedirs(target, exist_ok=True)
+    for file in qf2_data["files"]:
+        fpath = os.path.join(target, file["path"])
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        data = (base64.b64decode(file["content"]) if file["storetype"] == "b64"
+                else urllib.parse.unquote(file["content"]))
+        with open(fpath, 'wb') as out:
+            out.write(data.encode() if isinstance(data, str) else data)
+    print(f"✔ Built into {target}")
+
+def git_to_qf2(repo_url, output=None):
     with tempfile.TemporaryDirectory() as tmp:
-        print(f"🔃 Cloning {git_url} ...")
-        result = subprocess.run(["git", "clone", "--depth", "1", git_url, tmp], capture_output=True)
-        if result.returncode != 0:
-            print("❌ Git clone failed:")
-            print(result.stderr.decode())
-            sys.exit(1)
-        repo_name = get_repo_name_from_git_config(tmp) or "ClonedRepo"
-        print(f"✅ Repo detected as: {repo_name}")
-        return folder_to_json(tmp, folder_name_override=repo_name), repo_name
+        subprocess.run(["git", "clone", "--depth=1", repo_url, tmp], stdout=subprocess.DEVNULL)
+        repo_name = os.path.basename(repo_url.rstrip("/")).replace(".git", "")
+        output_name = output or f"{repo_name}.QF2"
+        save_qf2(tmp, output_name)
+        print(f"✔ Saved as {output_name}")
 
-def write_from_qf2(json_data, use_current=False):
-    target_folder = os.getcwd() if use_current else json_data['folder']
-    if not use_current and os.path.exists(target_folder):
-        print(f"⚠️ Deleting existing folder: {target_folder}")
-        shutil.rmtree(target_folder)
+def folder_to_qf2(folder_path, output=None):
+    output_name = output or os.path.basename(folder_path.rstrip("/")) + ".QF2"
+    save_qf2(folder_path, output_name)
+    print(f"✔ Saved as {output_name}")
 
-    for file in json_data['files']:
-        path = os.path.join(target_folder, file['path']) if not use_current else os.path.join(os.getcwd(), file['path'])
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if file.get("storetype", "URI") == "b64":
-            with open(path, 'wb') as f:
-                f.write(base64.b64decode(file['content']))
+def print_help():
+    print("""
+QStore - QF2 (QStore File 2) Code Packager
+
+Commands:
+  python3 QStore.py git <repo_url> [optional_output.QF2]
+  python3 QStore.py store <folder_path> [optional_output.QF2]
+  python3 QStore.py open <QF2 file or ?current to paste> [optional_output_folder]
+  python3 QStore.py <file.QF2>
+
+Special options:
+  ?current   Use current working directory for output (instead of folder in QF2)
+  --help, -h Show this help menu
+""")
+
+def main():
+    args = sys.argv[1:]
+    if not args or '--help' in args or '-h' in args:
+        print_help()
+        return
+
+    cmd = args[0]
+
+    if cmd == "git" and len(args) >= 2:
+        repo_url = args[1]
+        output = args[2] if len(args) > 2 else None
+        if output == "?current":
+            output = os.path.basename(repo_url.rstrip("/")).replace(".git", "") + ".QF2"
+        git_to_qf2(repo_url, output)
+
+    elif cmd == "store" and len(args) >= 2:
+        folder = args[1]
+        output = args[2] if len(args) > 2 else None
+        if output == "?current":
+            output = os.path.basename(os.path.abspath(folder)) + ".QF2"
+        folder_to_qf2(folder, output)
+
+    elif cmd == "open" and len(args) >= 2:
+        qf2_source = args[1]
+        output_dir = args[2] if len(args) > 2 else None
+        if qf2_source == "?current":
+            print("Paste QF2 JSON below:")
+            qf2_data = json.loads(sys.stdin.read())
         else:
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(urlparse.unquote(file['content']))
-        print(f"✅ Created: {path}")
+            qf2_data = load_qf2(qf2_source)
+        out = os.getcwd() if output_dir == "?current" else output_dir
+        build_qf2(qf2_data, out)
 
-def show_help():
-    help_text = """
-QStore CLI - QStore.py
+    elif cmd.endswith(".QF2"):
+        qf2_data = load_qf2(cmd)
+        build_qf2(qf2_data)
 
-Usage:
-  python QStore.py --git <repo-url>        Convert Git repo (excludes .git) to QF2 .QF2 file
-  python QStore.py --make <folder>         Convert local folder to QF2 (.QF2 file)
-  python QStore.py file.QF2 [--uc]         Build files from a saved QF2 file
-  python QStore.py [--uc]                  Paste QF2 JSON manually and build
-
-Options:
-  --git <repo-url>       Clone and convert a Git repo (ignores .git)
-  --make <folder>        Convert folder to QF2 JSON file
-  --uc / --use-current   Output files into current directory
-  --help / --h / -h      Show this help message
-"""
-    print(help_text)
+    else:
+        print("Unknown command. Use --help for instructions.")
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    use_current = "--uc" in args or "--use-current" in args
-    file_args = [a for a in args if not a.startswith('--') and a.endswith(('.qf2', '.QF2', '.txt'))]
-
-    if any(arg in ["--help", "--h", "-h"] for arg in args):
-        show_help()
-        sys.exit(0)
-
-    if "--git" in args:
-        try:
-            idx = args.index("--git")
-            url = args[idx + 1]
-            result, repo_name = clone_and_convert(url)
-            out_file = f"{repo_name}.QF2"
-            with open(out_file, "w") as f:
-                json.dump(result, f, indent=2)
-            print(f"✅ Saved QF2 file to: {out_file}")
-        except Exception as e:
-            print("❌ Error during --git:", e)
-        sys.exit()
-
-    if "--make" in args:
-        try:
-            idx = args.index("--make")
-            pattern = args[idx + 1]
-            matches = glob.glob(pattern)
-            if not matches:
-                print("❌ No folder matched:", pattern)
-                sys.exit(1)
-            folder_path = matches[0]
-            result = folder_to_json(folder_path)
-            out_file = f"{result['folder']}.QF2"
-            with open(out_file, "w") as f:
-                json.dump(result, f, indent=2)
-            print(f"✅ Saved QF2 file to: {out_file}")
-        except Exception as e:
-            print("❌ Error during --make:", e)
-        sys.exit()
-
-    if file_args:
-        try:
-            with open(file_args[0], "r", encoding="utf-8") as f:
-                data = json.load(f)
-                write_from_qf2(data, use_current=use_current)
-        except Exception as e:
-            print(f"❌ Failed to load {file_args[0]}:", e)
-        sys.exit()
-
-    print("📝 Paste QF2 JSON below (Ctrl+D to finish):")
-    try:
-        input_text = sys.stdin.read()
-        data = json.loads(input_text)
-        write_from_qf2(data, use_current=use_current)
-    except Exception as e:
-        print("❌ Error processing input:", e)
+    main()
